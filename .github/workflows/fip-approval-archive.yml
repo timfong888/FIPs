@@ -1,0 +1,285 @@
+name: FIP Approval Archive
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: read
+
+jobs:
+  archive-approved-fip:
+    runs-on: ubuntu-22.04
+    if: contains(github.event.comment.body, 'FIP has been approved')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: |
+          npm install -g filecoin-pin
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Extract FIP metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_NUMBER=${{ github.event.issue.number }}
+          REPO="${{ github.repository }}"
+
+          # Get issue details
+          ISSUE_DATA=$(gh api repos/$REPO/issues/$ISSUE_NUMBER)
+
+          # Extract metadata
+          ISSUE_TITLE=$(echo "$ISSUE_DATA" | jq -r '.title')
+          ISSUE_AUTHOR=$(echo "$ISSUE_DATA" | jq -r '.user.login')
+          ISSUE_CREATED=$(echo "$ISSUE_DATA" | jq -r '.created_at')
+          ISSUE_URL=$(echo "$ISSUE_DATA" | jq -r '.html_url')
+
+          # Approval metadata
+          APPROVER="${{ github.event.comment.user.login }}"
+          APPROVAL_DATE="${{ github.event.comment.created_at }}"
+          COMMENT_URL="${{ github.event.comment.html_url }}"
+
+          # Save to environment
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_ENV
+          echo "ISSUE_TITLE=$ISSUE_TITLE" >> $GITHUB_ENV
+          echo "ISSUE_AUTHOR=$ISSUE_AUTHOR" >> $GITHUB_ENV
+          echo "ISSUE_CREATED=$ISSUE_CREATED" >> $GITHUB_ENV
+          echo "ISSUE_URL=$ISSUE_URL" >> $GITHUB_ENV
+          echo "APPROVER=$APPROVER" >> $GITHUB_ENV
+          echo "APPROVAL_DATE=$APPROVAL_DATE" >> $GITHUB_ENV
+          echo "COMMENT_URL=$COMMENT_URL" >> $GITHUB_ENV
+
+          echo "Metadata extracted for issue #$ISSUE_NUMBER"
+
+      - name: Collect FIP data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_NUMBER=${{ env.ISSUE_NUMBER }}
+          REPO="${{ github.repository }}"
+          ARCHIVE_DIR="fip-archives/fip-${ISSUE_NUMBER}"
+
+          mkdir -p "$ARCHIVE_DIR"
+
+          # Get complete issue data
+          gh api repos/$REPO/issues/$ISSUE_NUMBER > "$ARCHIVE_DIR/issue.json"
+
+          # Get all comments
+          gh api repos/$REPO/issues/$ISSUE_NUMBER/comments --paginate > "$ARCHIVE_DIR/comments.json"
+
+          # Get issue timeline (events)
+          gh api repos/$REPO/issues/$ISSUE_NUMBER/timeline --paginate > "$ARCHIVE_DIR/timeline.json"
+
+          # Get linked files if this is a PR
+          if gh api repos/$REPO/issues/$ISSUE_NUMBER | jq -e '.pull_request' > /dev/null; then
+            gh api repos/$REPO/pulls/$ISSUE_NUMBER/files > "$ARCHIVE_DIR/files.json"
+          fi
+
+          echo "ARCHIVE_DIR=$ARCHIVE_DIR" >> $GITHUB_ENV
+
+      - name: Generate README log
+        run: |
+          ARCHIVE_DIR=${{ env.ARCHIVE_DIR }}
+          README="$ARCHIVE_DIR/README.md"
+
+          cat > "$README" << 'EOF'
+          # FIP Approval Archive
+
+          ## Approval Information
+
+          | Field | Value |
+          |-------|-------|
+          | **FIP Issue** | [#${{ env.ISSUE_NUMBER }}](${{ env.ISSUE_URL }}) |
+          | **Title** | ${{ env.ISSUE_TITLE }} |
+          | **Author** | @${{ env.ISSUE_AUTHOR }} |
+          | **Created** | ${{ env.ISSUE_CREATED }} |
+          | **Approved By** | @${{ env.APPROVER }} |
+          | **Approval Date** | ${{ env.APPROVAL_DATE }} |
+          | **Approval Comment** | [${{ env.COMMENT_URL }}](${{ env.COMMENT_URL }}) |
+
+          ## Archive Contents
+
+          This archive contains:
+
+          - `issue.json` - Complete issue data
+          - `comments.json` - All comments with full thread
+          - `timeline.json` - Complete timeline of events
+          - `files.json` - Changed files (if PR)
+          - `README.md` - This file
+
+          ## Context
+
+          When a FIP reaches the required approval threshold, a comment stating "FIP has been approved"
+          triggers this archival process. All information related to the FIP is collected and permanently
+          stored on Filecoin for historical record and cryptographic proof.
+
+          ## Filecoin Storage
+
+          This data is stored on Filecoin using the filecoin-pin service, providing:
+
+          - Permanent decentralized storage
+          - Cryptographic proof of data possession (PDP)
+          - IPFS content addressing for retrieval
+          - Verifiable on-chain storage proofs
+
+          ---
+
+          **Archive Generated**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **GitHub Action Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+
+          echo "README generated at $README"
+
+      - name: Upload to Filecoin
+        env:
+          PRIVATE_KEY: ${{ secrets.FILECOIN_PRIVATE_KEY }}
+          RPC_URL: ${{ secrets.FILECOIN_RPC_URL }}
+        run: |
+          ARCHIVE_DIR=${{ env.ARCHIVE_DIR }}
+
+          # Upload archive directory to Filecoin
+          OUTPUT=$(filecoin-pin add "$ARCHIVE_DIR" 2>&1 | tee upload-output.txt)
+
+          # Extract metadata
+          ROOT_CID=$(echo "$OUTPUT" | grep 'Root CID:' | awk '{print $3}' || echo "N/A")
+          PIECE_CID=$(echo "$OUTPUT" | grep 'Piece CID:' | awk '{print $3}' || echo "N/A")
+          SIZE=$(echo "$OUTPUT" | grep 'Size:' | awk '{print $2}' || echo "N/A")
+          DATASET_ID=$(echo "$OUTPUT" | grep 'Data Set ID:' | awk '{print $4}' || echo "N/A")
+          TX_HASH=$(echo "$OUTPUT" | grep 'Hash:' | awk '{print $2}' || echo "N/A")
+          DOWNLOAD_URL=$(echo "$OUTPUT" | grep 'Direct Download URL:' | awk '{print $4}' || echo "N/A")
+
+          # Save to environment
+          echo "ROOT_CID=$ROOT_CID" >> $GITHUB_ENV
+          echo "PIECE_CID=$PIECE_CID" >> $GITHUB_ENV
+          echo "SIZE=$SIZE" >> $GITHUB_ENV
+          echo "DATASET_ID=$DATASET_ID" >> $GITHUB_ENV
+          echo "TX_HASH=$TX_HASH" >> $GITHUB_ENV
+          echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
+
+      - name: Update README with Filecoin metadata
+        run: |
+          ARCHIVE_DIR=${{ env.ARCHIVE_DIR }}
+          README="$ARCHIVE_DIR/README.md"
+
+          cat >> "$README" << EOF
+
+          ## Filecoin Upload Details
+
+          | Field | Value |
+          |-------|-------|
+          | **Root CID** | \`${{ env.ROOT_CID }}\` |
+          | **Piece CID** | \`${{ env.PIECE_CID }}\` |
+          | **Size** | ${{ env.SIZE }} |
+          | **Data Set ID** | ${{ env.DATASET_ID }} |
+          | **Transaction Hash** | [\`${{ env.TX_HASH }}\`](https://calibration.filfox.info/tx/${{ env.TX_HASH }}) |
+          | **Download URL** | ${{ env.DOWNLOAD_URL }} |
+
+          ### IPFS Gateway Access
+
+          - **View README**: https://ipfs.io/ipfs/${{ env.ROOT_CID }}/README.md
+          - **View Issue Data**: https://ipfs.io/ipfs/${{ env.ROOT_CID }}/issue.json
+          - **View Comments**: https://ipfs.io/ipfs/${{ env.ROOT_CID }}/comments.json
+          - **Browse All Files**: https://ipfs.io/ipfs/${{ env.ROOT_CID }}
+          EOF
+
+      - name: Create archive log
+        run: |
+          mkdir -p logs
+          TIMESTAMP=$(date -u +"%Y-%m-%d-%H%M%S")
+          LOG_FILE="logs/fip-${{ env.ISSUE_NUMBER }}-${TIMESTAMP}.md"
+
+          cat > "$LOG_FILE" << 'EOF'
+          # FIP Archive Log
+
+          ## FIP Information
+
+          - **Issue Number**: #${{ env.ISSUE_NUMBER }}
+          - **Title**: ${{ env.ISSUE_TITLE }}
+          - **Author**: @${{ env.ISSUE_AUTHOR }}
+          - **Approved By**: @${{ env.APPROVER }}
+          - **Approval Date**: ${{ env.APPROVAL_DATE }}
+
+          ## Filecoin Storage
+
+          | Field | Value |
+          |-------|-------|
+          | **Root CID** | `${{ env.ROOT_CID }}` |
+          | **Piece CID** | `${{ env.PIECE_CID }}` |
+          | **Size** | ${{ env.SIZE }} |
+          | **Transaction** | [${{ env.TX_HASH }}](https://calibration.filfox.info/tx/${{ env.TX_HASH }}) |
+
+          ## Quick Access
+
+          - [View on IPFS](https://ipfs.io/ipfs/${{ env.ROOT_CID }})
+          - [Original Issue](${{ env.ISSUE_URL }})
+          - [Approval Comment](${{ env.COMMENT_URL }})
+
+          ---
+
+          **Archived**: ${TIMESTAMP}
+          EOF
+
+          echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
+
+      - name: Commit archive and logs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add fip-archives/ logs/
+          git commit -m "Archive FIP #${{ env.ISSUE_NUMBER }} - approved by @${{ env.APPROVER }} [skip ci]" || echo "No changes to commit"
+          git push
+
+      - name: Comment on issue with archive info
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "## 📦 FIP Archived to Filecoin
+
+          This FIP has been permanently archived to Filecoin's decentralized storage network.
+
+          ### Archive Details
+          - **Root CID**: \`${{ env.ROOT_CID }}\`
+          - **Transaction**: [\`${{ env.TX_HASH }}\`](https://calibration.filfox.info/tx/${{ env.TX_HASH }})
+          - **Size**: ${{ env.SIZE }}
+
+          ### Access Archived Data
+          - 🔗 [View on IPFS](https://ipfs.io/ipfs/${{ env.ROOT_CID }})
+          - 📄 [README](https://ipfs.io/ipfs/${{ env.ROOT_CID }}/README.md)
+          - 💬 [All Comments](https://ipfs.io/ipfs/${{ env.ROOT_CID }}/comments.json)
+
+          This archive includes the complete issue thread, all comments, timeline events, and metadata."
+
+      - name: Create summary
+        run: |
+          echo "# 📦 FIP #${{ env.ISSUE_NUMBER }} Archived to Filecoin" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Approval Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Approved by**: @${{ env.APPROVER }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date**: ${{ env.APPROVAL_DATE }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Comment**: [${{ env.COMMENT_URL }}](${{ env.COMMENT_URL }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Filecoin Archive" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Root CID**: \`${{ env.ROOT_CID }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Piece CID**: \`${{ env.PIECE_CID }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size**: ${{ env.SIZE }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Transaction**: [\`${{ env.TX_HASH }}\`](https://calibration.filfox.info/tx/${{ env.TX_HASH }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Quick Access" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 **[Browse Archive on IPFS](https://ipfs.io/ipfs/${{ env.ROOT_CID }})**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📝 **Log saved**: \`${{ env.LOG_FILE }}\`" >> $GITHUB_STEP_SUMMARY
